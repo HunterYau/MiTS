@@ -1,4 +1,3 @@
-# model 2
 # ===========================
 # MILModel (Segmentation-style MIL) - Full Script
 # Copy/paste as a single file and run.
@@ -13,7 +12,6 @@ import torch
 assert torch.cuda.is_available(), "Cuda not available"
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -43,8 +41,8 @@ MASK_ROOT = "./Manual_Testing/masks"
 CHECKPOINT_PATH = "./checkpoints/MiTS.pth"
 
 NUM_CLASSES = 3      # change to 2 if you have tumor vs no_tumor [glioma, meningioma, pituitary]
-BATCH_SIZE = 20
-NUM_WORKERS = 6
+BATCH_SIZE = 60
+NUM_WORKERS = 32
 EPOCHS = 100
 
 LR = 1e-4
@@ -605,74 +603,6 @@ def tau_schedule(epoch, epochs, start=1.2, end=3.0, warm_frac=0.4):
     return end
 
 
-@torch.no_grad()
-def save_mil_grid(
-    model,
-    images,
-    targets,
-    save_path,
-    upsample_to=(256, 256),
-):
-    """
-    Saves a grid:
-    Row 1: input images
-    Row 2: predicted-class MIL maps
-    Row 3: true-class MIL maps
-    """
-    model.eval()
-    outputs, _, full_maps, _ = model(images)
-
-    preds = outputs.argmax(dim=1)
-
-    B = images.size(0)
-    fig, axes = plt.subplots(3, B, figsize=(3*B, 9))
-
-    for i in range(B):
-        img = denormalize(images[i])
-
-        # Predicted map
-        pred_map = torch.sigmoid(full_maps[i, preds[i]])
-        pred_map = F.interpolate(
-            pred_map.unsqueeze(0).unsqueeze(0),
-            size=upsample_to,
-            mode="bilinear",
-            align_corners=False
-        ).squeeze().cpu().numpy()
-        pred_map = (pred_map - pred_map.min()) / (pred_map.max() - pred_map.min() + 1e-8)
-
-        # True map
-        true_map = torch.sigmoid(full_maps[i, targets[i]])
-        true_map = F.interpolate(
-            true_map.unsqueeze(0).unsqueeze(0),
-            size=upsample_to,
-            mode="bilinear",
-            align_corners=False
-        ).squeeze().cpu().numpy()
-        true_map = (true_map - true_map.min()) / (true_map.max() - true_map.min() + 1e-8)
-
-        # Row 1: input
-        axes[0, i].imshow(img)
-        axes[0, i].set_title(f"Input")
-        axes[0, i].axis("off")
-
-        # Row 2: predicted
-        axes[1, i].imshow(img)
-        axes[1, i].imshow(pred_map, alpha=0.5)
-        axes[1, i].set_title(f"Pred: {preds[i].item()}")
-        axes[1, i].axis("off")
-
-        # Row 3: true
-        axes[2, i].imshow(img)
-        axes[2, i].imshow(true_map, alpha=0.5)
-        axes[2, i].set_title(f"True: {targets[i].item()}")
-        axes[2, i].axis("off")
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-
-
 # NEW: Calculates HD95 score
 def hd95_2d(pred: np.ndarray, gt: np.ndarray) -> float:
     pred = pred.astype(bool)
@@ -770,15 +700,16 @@ def mask_validation(model):
         for imgs, masks in diceloader:
             imgs, masks = imgs.to(device), masks.to(device)
             _, _, full_maps, _ = model(imgs)
+            logits, _ = full_maps.max(dim=1, keepdim=True)     # [B, 1, H, W]
 
             # dice
-            inter, pred_sum, targ_sum = dice_global_accumulate_from_logits(full_maps, masks)
+            inter, pred_sum, targ_sum = dice_global_accumulate_from_logits(logits, masks)
             total_inter += inter.item()
             total_pred += pred_sum.item()
             total_targ += targ_sum.item()
 
             # HD95
-            sum_hd += hd95_batch_mean_from_logits(full_maps, masks)
+            sum_hd += hd95_batch_mean_from_logits(logits, masks)
             count_batches += 1
 
     dice = (2 * total_inter + eps) / (total_pred + total_targ + eps)
@@ -814,14 +745,11 @@ def training(model, optimizer, start_epoch, epochs):
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
     scaler = GradScaler("cuda" if torch.cuda.is_available() else "cpu")
 
-    # fixed_images, fixed_targets = next(iter(valloader))
-    # fixed_images = fixed_images[:NUM_VIZ_SAMPLES].to(device)
-    # fixed_targets = fixed_targets[:NUM_VIZ_SAMPLES].to(device)
-
     train_losses, train_accuracies, learning_rates = [], [], []
 
     for epoch in range(start_epoch, epochs):
-        model.mil_head.tau = float(tau_schedule(epoch, EPOCHS, start=1.5, end=3.5, warm_frac=0.5))
+        tau_value = tau_schedule(epoch, EPOCHS, start=1.5, end=3.5, warm_frac=0.4)
+        model.mil_head.tau = float(tau_value)
         model.mil_head._printed_this_epoch = False
 
         model.train()
@@ -914,11 +842,11 @@ def training(model, optimizer, start_epoch, epochs):
         dice, hd95 = mask_validation(model)
 
         print(f"Epoch {epoch+1}: Avg loss: {avg_loss:.4f}, Train Acc: {train_acc*100:.2f}%, Test Acc: {test_acc:.2f}%, "
-              f"    Logit scale: {model.mil_head.logit_scale.item()}, Dice: {dice:.5f}")
+              f"    Logit scale: {model.mil_head.logit_scale.item()}, Dice: {dice:.5f}, HD95f {hd95:.2f}, Tau: {tau_value:.3f}")
 
         # Saves epoch info into a .txt file
         with open("./figures/MiTS.txt", "a") as f:
-            f.write(f"{epoch + 1},{avg_loss:.4f},{test_acc:.2f},{learning_rates[-1]:.9f},{dice:.3f},{hd95:.2f}\n")
+            f.write(f"{epoch + 1},{avg_loss:.4f},{test_acc:.2f},{learning_rates[-1]:.9f},{dice:.3f},{hd95:.2f},{tau_value:.3f}\n")
 
         # Save checkpoint each epoch
         torch.save(
@@ -929,15 +857,6 @@ def training(model, optimizer, start_epoch, epochs):
             },
             CHECKPOINT_PATH
         )
-
-        # Vizualization of model full maps
-        # if (epoch + 1) % 5 == 0:
-        #     save_mil_grid(
-        #         model,
-        #         fixed_images,
-        #         fixed_targets,
-        #         save_path=f"./viz/Model4_epoch_{epoch + 1:03d}.png"
-        #     )
 
     return train_losses, train_accuracies, learning_rates
 
@@ -1120,15 +1039,6 @@ def main():
     print(full_maps.mean())
 
     pred = outputs.argmax(dim=1)[0].item()
-    # true = targets[0].item()
-
-    true_map = None
-    # if VIS_SHOW_TRUE_AND_PRED:
-    #     # targets must exist in this branch
-    #     true_logits0 = full_maps[0, true]  # [h,w]
-    #     true_map = true_logits0.unsqueeze(0)  # [1,h,w]
-    #
-    # print(f"Predicted: {trainset.classes[pred]} | True: {trainset.classes[true]}")
 
     m, binary, cls = mil_mask_from_full_maps(outputs, full_maps, thr=0.5)
     dice = dice_np(binary, mask)
@@ -1144,7 +1054,7 @@ def main():
         vis_map,
         upsample_to=(256, 256),
         title="MIL (LogSumExpo) Attention/Map",
-        true_map=true_map
+        true_map=None
     )
 
 
