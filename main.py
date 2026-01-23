@@ -4,12 +4,12 @@
 # ===========================
 
 import os
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import math
-
 import torch
 assert torch.cuda.is_available(), "Cuda not available"
+
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
@@ -38,7 +38,7 @@ TRAIN_ROOT = "./data/BrainTumor/Training"
 VAL_ROOT = "./data/BrainTumor/Testing"
 DICE_ROOT = "./Manual_Testing/imgs"
 MASK_ROOT = "./Manual_Testing/masks"
-CHECKPOINT_PATH = "./checkpoints/MiTS.pth"
+CHECKPOINT_PATH = "./checkpoints/MiTS100-3.pth"
 
 NUM_CLASSES = 3      # change to 2 if you have tumor vs no_tumor [glioma, meningioma, pituitary]
 BATCH_SIZE = 60
@@ -53,7 +53,7 @@ GAMMA = 0.3
 K_RATIO = 0.08           # try 0.01 (smaller region) ... 0.05 (bigger region)
 
 # Tau SegMILHead    # higher tau = greater mean pooling
-TAU = 2.6           # lower tau = greater max pooling
+TAU = 1.5           # lower tau = greater max pooling
 
 # Map regularization weights
 LAMBDA_TV = 0.4
@@ -822,12 +822,6 @@ def training(model, optimizer, start_epoch, epochs):
             correct += (preds == targets).sum().item()
             total_loss += loss.item()
 
-            if (idx + 1) % 100 == 0:
-                print(
-                    f"   Epoch: [{epoch+1}/{epochs}], Batch: [{idx+1}/{len(trainloader)}], "
-                    f"Loss: {loss.item():.4f}, LR: {learning_rates[-1]}"
-                )
-
         scheduler.step()
 
         avg_loss = total_loss / max(1, len(trainloader))
@@ -842,11 +836,11 @@ def training(model, optimizer, start_epoch, epochs):
         dice, hd95 = mask_validation(model)
 
         print(f"Epoch {epoch+1}: Avg loss: {avg_loss:.4f}, Train Acc: {train_acc*100:.2f}%, Test Acc: {test_acc:.2f}%, "
-              f"    Logit scale: {model.mil_head.logit_scale.item()}, Dice: {dice:.5f}, HD95f {hd95:.2f}, Tau: {tau_value:.3f}")
+              f"    Logit scale: {model.mil_head.logit_scale.item():.4f}, Dice: {dice:.5f}, HD95: {hd95:.2f}, Tau: {tau_value:.3f}")
 
         # Saves epoch info into a .txt file
-        with open("./figures/MiTS.txt", "a") as f:
-            f.write(f"{epoch + 1},{avg_loss:.4f},{test_acc:.2f},{learning_rates[-1]:.9f},{dice:.3f},{hd95:.2f},{tau_value:.3f}\n")
+        with open("./figures/MiTS100-3.txt", "a") as f:
+            f.write(f"{epoch + 1},{avg_loss:.4f},{test_acc:.2f},{learning_rates[-1]:.9f},{dice:.3f},{hd95:.2f},{tau_value:.3f},{model.mil_head.logit_scale.item():.4f}\n")
 
         # Save checkpoint each epoch
         torch.save(
@@ -877,7 +871,7 @@ def denormalize(img_tensor):
 
 
 @torch.no_grad()
-def visualize_mil_map(input_tensor, pred_map, upsample_to=(256, 256), title="MIL Map", true_map=None):
+def visualize_mil_map(input_tensor, pred_map, image_idx, upsample_to=(256, 256), title="MIL Map", true_map=None):
     """
     input_tensor: [B,3,H,W] normalized
     pred_map:     [B,h,w] raw logits map (not sigmoid) for predicted class
@@ -909,6 +903,7 @@ def visualize_mil_map(input_tensor, pred_map, upsample_to=(256, 256), title="MIL
         plt.imshow(pred_vis, alpha=0.5)
         plt.axis("off")
         plt.tight_layout()
+        plt.savefig(f"./figures/{image_idx}HM.png", dpi=300, bbox_inches="tight")
         plt.show()
         return
 
@@ -934,6 +929,7 @@ def visualize_mil_map(input_tensor, pred_map, upsample_to=(256, 256), title="MIL
 
     plt.tight_layout()
     plt.show()
+    plt.close()
 
 
 # Visualization mask form
@@ -978,6 +974,48 @@ def dice_np(pred_mask, true_mask, eps=1e-8):
     return (2.0 * inter + eps) / (denom + eps)
 
 
+def hd95_single(pred_mask, true_mask, spacing=(1.0, 1.0)):
+    """
+    Compute the 95th-percentile Hausdorff Distance (HD95) between two binary masks for a single image.
+
+    pred_mask, true_mask: 2D arrays (H,W) of {0,1} or bool
+    spacing: (sy, sx) pixel spacing; use real MRI spacing if you have it (e.g., (0.7, 0.7))
+
+    Returns:
+        float: HD95 (in same units as spacing, default pixels)
+    """
+    pred = np.asarray(pred_mask).astype(bool)
+    true = np.asarray(true_mask).astype(bool)
+
+    # --- Edge cases ---
+    if not pred.any() and not true.any():
+        return 0.0  # both empty => perfect
+    if pred.any() != true.any():
+        return float("inf")  # one empty, one not => undefined/very bad
+
+    # 8-connected structure in 2D
+    conn = generate_binary_structure(rank=2, connectivity=2)
+
+    # Extract boundaries (surface pixels)
+    pred_er = binary_erosion(pred, structure=conn, border_value=0)
+    true_er = binary_erosion(true, structure=conn, border_value=0)
+    pred_surf = pred ^ pred_er
+    true_surf = true ^ true_er
+
+    # Distance transform to the nearest surface pixel
+    # EDT expects sampling per axis as (sy, sx)
+    dt_true = distance_transform_edt(~true_surf, sampling=spacing)
+    dt_pred = distance_transform_edt(~pred_surf, sampling=spacing)
+
+    # Surface-to-surface distances
+    d_pred_to_true = dt_true[pred_surf]
+    d_true_to_pred = dt_pred[true_surf]
+
+    # Combine both directions and take the 95th percentile
+    all_d = np.concatenate([d_pred_to_true, d_true_to_pred])
+    return float(np.percentile(all_d, 95))
+
+
 def load_checkpoint(model, optimizer):
     if os.path.exists(CHECKPOINT_PATH):
         print(f"Loading checkpoint: {CHECKPOINT_PATH}")
@@ -1017,14 +1055,14 @@ def main():
     os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
     # Single image with mask comparison
-    viz_index = "14"
+    viz_index = "20"
     images = transform_test(Image.open(f"./Manual_Testing/imgs/{viz_index}.png").convert("RGB")).unsqueeze(0).to(device)
     mask = transform_mask(Image.open(f"./Manual_Testing/masks/{viz_index}.png").convert("L"))
     mask = (mask > 0.5).int()  # torch binary
     mask = mask.squeeze().cpu().numpy()  # numpy binary
 
     # Train
-    training(model, optimizer, start_epoch, EPOCHS)
+    # training(model, optimizer, start_epoch, EPOCHS)
 
     # Quick visualize on one test batch
     model.eval()
@@ -1042,16 +1080,32 @@ def main():
 
     m, binary, cls = mil_mask_from_full_maps(outputs, full_maps, thr=0.5)
     dice = dice_np(binary, mask)
-    print("Dice: ", dice)
+    hd95 = hd95_single(binary, mask)
+    print("Dice: ", dice, "    HD95: ", hd95)
+
+    img = denormalize(images[0])
+
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.title("Ground Truth Mask")
+    plt.imshow(img)
+    plt.imshow(mask, alpha=0.5, cmap="gray")
+    plt.axis("off")
 
     plt.subplot(1, 2, 2)
-    plt.imshow(binary, cmap="gray")
-    plt.title("Predicted Mask")
+    plt.title(f"Predicted Mask\n Dice: {dice:.3f}\n HD95: {hd95:.2f}")
+    plt.imshow(img)
+    plt.imshow(binary, alpha=0.5, cmap="gray")
     plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(f"./figures/{viz_index}Mask.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
 
     visualize_mil_map(
         images,
         vis_map,
+        image_idx=viz_index,
         upsample_to=(256, 256),
         title="MIL (LogSumExpo) Attention/Map",
         true_map=None
